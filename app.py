@@ -2,6 +2,7 @@
 import difflib
 import hashlib
 import html as html_lib
+import io
 import json
 import os
 import re
@@ -13,12 +14,7 @@ from urllib.parse import quote
 
 import requests
 import streamlit as st
-
-try:
-    from audio_recorder_streamlit import audio_recorder
-    HAS_RECORDER = True
-except ImportError:  # 未安装时不影响其他功能，跟读面板内给出提示
-    HAS_RECORDER = False
+import streamlit.components.v1 as components
 
 # ---------- 页面基础配置 ----------
 st.set_page_config(
@@ -214,84 +210,153 @@ def match_scene_audio(scene: str) -> str | None:
     return None
 
 
-# ---------- 在线语音合成（edge-tts，微软神经语音） ----------
-TTS_CACHE_DIR = "tts_cache"
-TTS_VOICES = ["en-US-AriaNeural", "en-US-GuyNeural"]  # 角色A=Aria（女声），角色B=Guy（男声）
-TTS_MAX_RETRY = 3        # 合成失败重试次数（云端网络抖动时很关键）
-TTS_MIN_BYTES = 1024     # 小于 1KB 视为异常产物（正常一句英文 15~40KB），避免 0:00 空播放器
+# ---------- 朗读组件（浏览器原生 Web Speech API，服务器零依赖） ----------
+# 云端服务器屏蔽了所有 TTS 接口（edge-tts / gTTS 均连不上，播放器 0:00），
+# 改用浏览器原生 window.speechSynthesis：音频在用户浏览器里合成并播放，
+# 服务器不出网、不装任何 TTS 库，也不再有 st.audio 空播放器问题。
+# 角色声音区分：Web Speech 无真声库概念，用 pitch（音调）+ rate（语速）模拟——
+# 第一位角色 (1.0, 1.0) 明亮正常（模拟女声），第二位 (0.8, 0.95) 低沉稍慢（模拟男声）。
+
+VOICE_PROFILES = [(1.0, 1.0), (0.8, 0.95)]  # 按出场顺序轮换
 
 
-def _run_coro_safely(coro):
-    """在当前线程没有运行中的事件循环时用 asyncio.run；已有循环则另起线程执行。
+def _js_escape(text: str) -> str:
+    """把台词安全嵌入 JS 单引号字符串：处理引号、反斜杠与换行。"""
+    return (
+        (text or "")
+        .replace("\\", "\\\\")
+        .replace("'", "\\'")
+        .replace('"', '\\"')
+        .replace("\n", " ")
+        .replace("\r", " ")
+    )
 
-    Streamlit Cloud 上脚本可能跑在带事件循环的上下文里，直接 asyncio.run 会抛
-    "asyncio.run() cannot be called from a running event loop"。
+
+# 按钮模板：占位符 __TEXT__ / __LABEL__ / __PITCH__ / __RATE__ 由 speak_button 填充
+# （不用 f-string：JS/CSS 的大量花括号转义太易错）
+_SPEAK_BTN_TMPL = """<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8">
+<style>
+  body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, "Microsoft YaHei", sans-serif; }
+  .speak-btn {
+    display: flex; align-items: center; justify-content: center; gap: 6px;
+    width: 100%; height: 36px; border: none; border-radius: 10px;
+    background: linear-gradient(135deg, #ff4b4b, #ff6b6b);
+    color: #fff; font-size: 14px; font-weight: 600; cursor: pointer;
+    transition: transform .12s ease, box-shadow .12s ease, filter .12s ease;
+    box-shadow: 0 2px 6px rgba(255, 75, 75, .35);
+  }
+  .speak-btn:hover { transform: translateY(-1px); filter: brightness(1.06); }
+  .speak-btn:active { transform: translateY(0); }
+  .speak-btn.speaking {
+    background: linear-gradient(135deg, #ffa412, #ffc04d);
+    box-shadow: 0 2px 6px rgba(255, 164, 18, .35);
+  }
+</style>
+</head>
+<body>
+<button id="lcSpeak" class="speak-btn" type="button">__LABEL__</button>
+<script>
+(function () {
+  var TEXT = '__TEXT__';
+  var PITCH = __PITCH__, RATE = __RATE__;
+  var btn = document.getElementById('lcSpeak');
+  var idleLabel = btn.textContent;
+  var speaking = false;
+
+  if (!('speechSynthesis' in window)) {
+    btn.textContent = '\u26a0\ufe0f \u5f53\u524d\u6d4f\u89c8\u5668\u4e0d\u652f\u6301\u8bed\u97f3\u6717\u8bfb';
+    btn.disabled = true;
+    btn.style.background = '#999';
+    btn.style.boxShadow = 'none';
+    btn.style.cursor = 'not-allowed';
+    return;
+  }
+  // 提前触发音色列表加载（Chrome 首次 getVoices 可能为空，onvoiceschanged 之后才有）
+  window.speechSynthesis.getVoices();
+
+  function pickVoice() {
+    var vs = window.speechSynthesis.getVoices();
+    // 优先 en-US 的自然音色（Google US / Microsoft Natural/Aria/Guy/Zira/David）
+    var prefer = /google|natural|aria|guy|zira|david/i;
+    var enUS = vs.filter(function (v) { return v.lang === 'en-US'; });
+    enUS.sort(function (a, b) {
+      return (prefer.test(a.name) ? 0 : 1) - (prefer.test(b.name) ? 0 : 1);
+    });
+    return enUS[0] || vs.filter(function (v) { return v.lang && v.lang.indexOf('en') === 0; })[0];
+  }
+
+  btn.addEventListener('click', function () {
+    var synth = window.speechSynthesis;
+    if (speaking) { synth.cancel(); return; }   // 播放中再点 = 停止
+    synth.cancel();                             // 同时只播一句，避免叠音
+    var u = new SpeechSynthesisUtterance(TEXT);
+    u.lang = 'en-US';
+    u.pitch = PITCH;
+    u.rate = RATE;
+    var v = pickVoice();
+    if (v) u.voice = v;
+    u.onstart = function () {
+      speaking = true;
+      btn.classList.add('speaking');
+      btn.textContent = '\u23f8 \u64ad\u653e\u4e2d \u00b7 \u70b9\u51fb\u505c\u6b62';
+    };
+    var done = function () {
+      speaking = false;
+      btn.classList.remove('speaking');
+      btn.textContent = idleLabel;
+    };
+    u.onend = done;
+    u.onerror = done;
+    synth.speak(u);
+    // 兜底：个别浏览器不触发 onstart —— 300ms 后若仍在播则手动置为播放态
+    setTimeout(function () {
+      if (!speaking && synth.speaking) {
+        speaking = true;
+        btn.classList.add('speaking');
+        btn.textContent = '\u23f8 \u64ad\u653e\u4e2d \u00b7 \u70b9\u51fb\u505c\u6b62';
+      }
+    }, 300);
+  });
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def speak_button(
+    text: str,
+    label: str = "\U0001F50A 播放语音",
+    pitch: float = 1.0,
+    rate: float = 1.0,
+    height: int = 44,
+) -> None:
+    """渲染自定义 HTML 朗读按钮：点击后用浏览器 Web Speech API 朗读英文台词。
+
+    - utterance.lang = 'en-US'；pitch/rate 按角色设置（A=1.0 明亮，B=0.8 低沉）
+    - 播放中按钮变为「⏸ 播放中 · 点击停止」，再点一次即停止（speechSynthesis.cancel）
+    - 优先选 en-US 自然音色（Google/Microsoft），找不到退任意英文音色
+    - 不支持 speechSynthesis 的浏览器会禁用按钮并给出文字提示
+    - 空文本直接不渲染（比如台词解析为空时）
     """
-    import asyncio
-    import threading
-
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)  # 常规路径：无运行中的 loop
-
-    box = {}
-
-    def _worker():
-        try:
-            box["result"] = asyncio.run(coro)
-        except Exception as e:  # noqa: BLE001
-            box["error"] = e
-
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
-    t.join()
-    if "error" in box:
-        raise box["error"]
-    return box.get("result")
-
-
-def tts_speak(text: str, voice: str = TTS_VOICES[0]) -> bytes:
-    """合成英文语音并**返回 MP3 字节**（不返回路径：云端相对路径易解析失败导致播放器 0:00）。
-
-    - 缓存：同文本 + 同声库命中缓存直接读字节，不重复合成（缓存文件同时做大小校验）
-    - 校验：生成后检查文件大小，0 字节或过小视为失败
-    - 重试：最多 TTS_MAX_RETRY 次，失败清理残缺文件后指数退避重试
-    """
-    os.makedirs(TTS_CACHE_DIR, exist_ok=True)
-    key = hashlib.md5(f"{voice}|{text}".encode("utf-8")).hexdigest()[:16]
-    mp3 = os.path.join(TTS_CACHE_DIR, f"{key}.mp3")
-
-    # ① 缓存命中且大小正常 → 直接返回字节
-    if os.path.exists(mp3) and os.path.getsize(mp3) >= TTS_MIN_BYTES:
-        with open(mp3, "rb") as f:
-            return f.read()
-
-    import edge_tts  # 懒加载：未安装时不影响应用其他功能
-
-    last_err = None
-    for attempt in range(1, TTS_MAX_RETRY + 1):
-        try:
-            _run_coro_safely(edge_tts.Communicate(text, voice).save(mp3))
-            size = os.path.getsize(mp3) if os.path.exists(mp3) else 0
-            # ② 大小校验：0 字节 / 异常小文件一律当失败（这正是 0:00 播放器的根因）
-            if size >= TTS_MIN_BYTES:
-                with open(mp3, "rb") as f:
-                    return f.read()
-            last_err = RuntimeError(f"生成的音频异常（仅 {size} 字节）")
-        except Exception as e:  # noqa: BLE001  网络/服务异常 → 重试
-            last_err = e
-        # ③ 清理残缺文件，退避后重试
-        if os.path.exists(mp3):
-            try:
-                os.remove(mp3)
-            except OSError:
-                pass
-        if attempt < TTS_MAX_RETRY:
-            import time
-            time.sleep(0.8 * attempt)
-
-    raise RuntimeError(f"语音合成失败（已重试 {TTS_MAX_RETRY} 次）：{last_err}")
+    clean = " ".join((text or "").split())
+    if not clean:
+        return
+    html = (
+        _SPEAK_BTN_TMPL
+        .replace("__TEXT__", _js_escape(clean))
+        .replace("__LABEL__", html_lib.escape(label))
+        .replace("__PITCH__", repr(float(pitch)))
+        .replace("__RATE__", repr(float(rate)))
+    )
+    # 新版 Streamlit（1.6x+）推荐 st.iframe（components.html 已标记弃用）；
+    # 旧版（1.34~）没有 st.iframe，回退到 components.html —— 两个 API 行为一致
+    if hasattr(st, "iframe"):
+        st.iframe(html, height=height)
+    else:
+        components.html(html, height=height)
 
 
 # ---------- 🖼️ 分享海报合成（Pillow） ----------
@@ -900,12 +965,18 @@ def parse_script(text: str) -> dict:
 
 
 def _voice_map(parsed: dict) -> dict:
-    """按出场顺序给每个说话人分配声库（A=Aria 女声，B=Guy 男声，更多角色轮换）。"""
+    """按出场顺序给每个说话人分配声音特征 (pitch 音调, rate 语速)。
+
+    Web Speech API 无真声库概念，用音调+语速模拟男女声：
+    第一位角色 → (1.0, 1.0) 明亮正常（模拟女声）；
+    第二位 → (0.8, 0.95) 低沉稍慢（模拟男声）；更多角色交替轮换。
+    返回 {角色名: (pitch, rate)}，调用方传给 speak_button。
+    """
     order = []
     for s, _, _ in parsed.get("dialogue") or []:
         if s not in order:
             order.append(s)
-    return {name: TTS_VOICES[i % len(TTS_VOICES)] for i, name in enumerate(order)}
+    return {name: VOICE_PROFILES[i % len(VOICE_PROFILES)] for i, name in enumerate(order)}
 
 
 def split_en_zh(text: str) -> tuple:
@@ -1056,7 +1127,7 @@ def render_script(parsed: dict) -> None:
         chips = "".join(f'<span class="lc-chip">👤 {esc(c)}</span>' for c in parsed["characters"][:6])
         st.markdown(f'<div class="lc-people">{chips}</div>', unsafe_allow_html=True)
 
-    # 声库映射：按出场顺序，角色A=Aria女声，角色B=Guy男声（更多角色轮换）
+    # 声音特征映射：按出场顺序，角色A=(1.0,1.0) 明亮，角色B=(0.8,0.95) 低沉（更多角色轮换）
     voice_of = _voice_map(parsed)
 
     # 每条对话单独渲染：气泡 HTML + 下方朗读按钮（按钮无法嵌入 HTML，须逐条穿插）
@@ -1069,36 +1140,28 @@ def render_script(parsed: dict) -> None:
             f'<div class="lc-en">{esc(en)}</div>{zh_html}</div></div>',
             unsafe_allow_html=True,
         )
-        # 🔊 朗读按钮：与气泡同侧对齐，按角色声库合成英文语音并在页面内播放
+        # 🔊 朗读按钮：浏览器原生 Web Speech API，与气泡同侧对齐，按角色音调/语速朗读
         if side == "left":
             btn_col, _ = st.columns([2, 3])
         else:
             _, btn_col = st.columns([3, 2])
-        if btn_col.button("🔊 播放语音", key=f"tts_{i}", use_container_width=True):
-            try:
-                audio_bytes = tts_speak(en, voice_of[speaker])
-                st.audio(audio_bytes, format="audio/mp3", autoplay=True)
-            except Exception as e:  # noqa: BLE001
-                st.error(f"语音合成失败：{e}（edge-tts 需联网访问微软服务；也可运行 `pip install edge-tts`）")
+        with btn_col:
+            _pitch, _rate = voice_of.get(speaker, VOICE_PROFILES[0])
+            speak_button(en, label="🔊 播放语音", pitch=_pitch, rate=_rate)
 
         # 🎤 跟读录音：先听上方原声 → 展开录音跟读 → 播放对比（临时录音，不保存本地）
+        # 用 Streamlit 官方原生 st.audio_input（1.26+ 自带，无需第三方包，
+        # 不会出现 audio-recorder-streamlit 那类 ASGI 兼容性崩溃）
         with st.expander("🎤 点击展开跟我读"):
-            if not HAS_RECORDER:
-                st.warning("录音组件未安装，请运行：pip install audio-recorder-streamlit")
-            else:
-                # key=f"rec_{i}" 固定组件身份：Streamlit 重跑时录音状态不丢（Rerun 关键）
-                # 停止说话约 0.8 秒后自动结束录音（pause_threshold 默认值）
-                audio_bytes = audio_recorder(
-                    text="点击麦克风开始录音",
-                    recording_color="#e8b62c",
-                    neutral_color="#6aa36f",
-                    icon_size="2x",
-                    key=f"rec_{i}",
-                )
-                if audio_bytes is not None and len(audio_bytes) > 44:
-                    # >44 字节 = WAV 头之外有实际音频数据（空录音只有头）
-                    st.success("录音成功！你可以点击上方播放对比。")
-                    st.audio(audio_bytes, format="audio/wav")
+            # key=f"rec_{i}" 固定组件身份：Streamlit 重跑时录音不丢（Rerun 关键）
+            # label 为必填参数，折叠显示（expander 标题已说明用途）
+            recorded = st.audio_input(
+                label="录音", label_visibility="collapsed", key=f"rec_{i}",
+            )
+            if recorded is not None:
+                if recorded.size > 1024:
+                    st.success("录音成功！点击下方播放，和上方原声对比一下～")
+                    st.audio(recorded)  # 原生组件自带格式信息，无需手动指定
 
     if parsed["expressions"]:
         st.markdown("**✨ 关键表达**（勾选 ⭐ 收进生词本）")
@@ -1222,10 +1285,6 @@ def render_dictation(parsed: dict, script_text: str) -> None:
     sig = hashlib.md5(script_text.encode("utf-8")).hexdigest()[:10]
     ss = st.session_state
 
-    audio_map = ss.get(f"dict_audio_{sig}")
-    if not isinstance(audio_map, dict):
-        audio_map = {}
-        ss[f"dict_audio_{sig}"] = audio_map  # {句序号: mp3 bytes}
     feedback = ss.get(f"dict_fb_{sig}")
     if not isinstance(feedback, dict):
         feedback = {}
@@ -1242,21 +1301,9 @@ def render_dictation(parsed: dict, script_text: str) -> None:
         with st.container(border=True):
             st.markdown(f"**第 {i} / {total} 句**")
 
-            clicked_play = st.button(
-                "🔊 播放音频", key=f"dict_play_{sig}_{i}", use_container_width=True,
-            )
-            if clicked_play:
-                try:
-                    with st.spinner("正在合成语音…"):
-                        audio_map[i] = tts_speak(sentence, TTS_VOICES[0])
-                except Exception as e:  # noqa: BLE001
-                    st.error(f"语音合成失败：{e}（edge-tts 需联网访问微软服务）")
-
-            if audio_map.get(i):
-                # 仅点击按钮的那一次自动播放；浏览器禁止无交互自动播放，故同时保留播放器手动重听
-                st.audio(audio_map[i], format="audio/mp3", autoplay=clicked_play)
-            else:
-                st.caption("点击上方按钮生成并播放音频（首次约需 1~2 秒）。")
+            # 🔊 播放音频：浏览器原生 Web Speech 朗读原句（不显示原文，即时播放可反复听）
+            speak_button(sentence, label="🔊 播放音频")
+            st.caption("点击按钮听原声，可反复播放；播放中再点一次即停止。")
 
             # 💡 中文提示：popover 只给语义，不显示英文拼写，避免直接抄答案
             with st.popover("💡 中文提示"):
@@ -1750,7 +1797,7 @@ with col_feature:
             col_clear.button("🧹 清空对话", on_click=_clear_chat, use_container_width=True)
 
             voice_map = _voice_map(parsed) if parsed else {}
-            ai_voice = voice_map.get(ai_role)
+            ai_voice = voice_map.get(ai_role)  # (pitch, rate) 元组；None 表示未匹配到角色
 
             # 历史消息：st.chat_message 渲染；AI 回复附翻译与朗读按钮
             for i, m in enumerate(ss.chat_history):
@@ -1763,13 +1810,12 @@ with col_feature:
                         st.markdown(en)
                         if zh:
                             st.caption(f"（{zh}）")
-                        if ai_voice:
-                            if st.button("🔊 播放语音", key=f"chat_tts_{i}"):
-                                try:
-                                    audio_bytes = tts_speak(" ".join(en.split()), ai_voice)
-                                    st.audio(audio_bytes, format="audio/mp3", autoplay=True)
-                                except Exception as e:  # noqa: BLE001
-                                    st.error(f"语音合成失败：{e}")
+                        # ai_voice 为 (pitch, rate) 元组；None 才表示没有声线
+                        if ai_voice is not None:
+                            speak_button(
+                                " ".join(en.split()),
+                                pitch=ai_voice[0], rate=ai_voice[1],
+                            )
 
             # 输入框（固定在列底部）
             user_line = st.chat_input("输入你的台词...")

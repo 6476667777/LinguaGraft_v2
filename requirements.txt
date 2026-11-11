@@ -1,6 +1,7 @@
 # Streamlit 1.34+ 才支持较完整的音频参数（loop 等），低版本会导致播放器异常
+# st.audio_input 需要 Streamlit 1.26+（官方原生录音组件，无需第三方包）
+# 朗读功能使用浏览器原生 Web Speech API（app.py 内嵌 HTML 组件），
+# 服务器端零 TTS 依赖——edge-tts / gTTS 均不再需要
 streamlit>=1.34.0
 requests>=2.31.0
-edge-tts>=6.1.0
 pillow>=10.0
-audio-recorder-streamlit>=0.0.10
