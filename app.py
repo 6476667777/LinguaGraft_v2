@@ -1,10 +1,13 @@
 """LinguaCraft —— AI 英语剧本生成器（流式打字机 + 动效 + 卡片排版版）"""
+import difflib
 import hashlib
 import html as html_lib
 import json
 import os
 import re
 import textwrap
+import threading
+import time
 from datetime import datetime
 from urllib.parse import quote
 
@@ -214,25 +217,81 @@ def match_scene_audio(scene: str) -> str | None:
 # ---------- 在线语音合成（edge-tts，微软神经语音） ----------
 TTS_CACHE_DIR = "tts_cache"
 TTS_VOICES = ["en-US-AriaNeural", "en-US-GuyNeural"]  # 角色A=Aria（女声），角色B=Guy（男声）
+TTS_MAX_RETRY = 3        # 合成失败重试次数（云端网络抖动时很关键）
+TTS_MIN_BYTES = 1024     # 小于 1KB 视为异常产物（正常一句英文 15~40KB），避免 0:00 空播放器
 
 
-def tts_speak(text: str, voice: str = TTS_VOICES[0]) -> str:
-    """用 edge_tts.Communicate 把英文文本合成 MP3 并返回路径；同文本+同声库命中缓存不重复合成。"""
+def _run_coro_safely(coro):
+    """在当前线程没有运行中的事件循环时用 asyncio.run；已有循环则另起线程执行。
+
+    Streamlit Cloud 上脚本可能跑在带事件循环的上下文里，直接 asyncio.run 会抛
+    "asyncio.run() cannot be called from a running event loop"。
+    """
+    import asyncio
+    import threading
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)  # 常规路径：无运行中的 loop
+
+    box = {}
+
+    def _worker():
+        try:
+            box["result"] = asyncio.run(coro)
+        except Exception as e:  # noqa: BLE001
+            box["error"] = e
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join()
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
+
+
+def tts_speak(text: str, voice: str = TTS_VOICES[0]) -> bytes:
+    """合成英文语音并**返回 MP3 字节**（不返回路径：云端相对路径易解析失败导致播放器 0:00）。
+
+    - 缓存：同文本 + 同声库命中缓存直接读字节，不重复合成（缓存文件同时做大小校验）
+    - 校验：生成后检查文件大小，0 字节或过小视为失败
+    - 重试：最多 TTS_MAX_RETRY 次，失败清理残缺文件后指数退避重试
+    """
     os.makedirs(TTS_CACHE_DIR, exist_ok=True)
     key = hashlib.md5(f"{voice}|{text}".encode("utf-8")).hexdigest()[:16]
     mp3 = os.path.join(TTS_CACHE_DIR, f"{key}.mp3")
-    if os.path.exists(mp3):
-        return mp3
 
-    import asyncio
+    # ① 缓存命中且大小正常 → 直接返回字节
+    if os.path.exists(mp3) and os.path.getsize(mp3) >= TTS_MIN_BYTES:
+        with open(mp3, "rb") as f:
+            return f.read()
 
     import edge_tts  # 懒加载：未安装时不影响应用其他功能
 
-    async def _gen() -> None:
-        await edge_tts.Communicate(text, voice).save(mp3)
+    last_err = None
+    for attempt in range(1, TTS_MAX_RETRY + 1):
+        try:
+            _run_coro_safely(edge_tts.Communicate(text, voice).save(mp3))
+            size = os.path.getsize(mp3) if os.path.exists(mp3) else 0
+            # ② 大小校验：0 字节 / 异常小文件一律当失败（这正是 0:00 播放器的根因）
+            if size >= TTS_MIN_BYTES:
+                with open(mp3, "rb") as f:
+                    return f.read()
+            last_err = RuntimeError(f"生成的音频异常（仅 {size} 字节）")
+        except Exception as e:  # noqa: BLE001  网络/服务异常 → 重试
+            last_err = e
+        # ③ 清理残缺文件，退避后重试
+        if os.path.exists(mp3):
+            try:
+                os.remove(mp3)
+            except OSError:
+                pass
+        if attempt < TTS_MAX_RETRY:
+            import time
+            time.sleep(0.8 * attempt)
 
-    asyncio.run(_gen())
-    return mp3
+    raise RuntimeError(f"语音合成失败（已重试 {TTS_MAX_RETRY} 次）：{last_err}")
 
 
 # ---------- 🖼️ 分享海报合成（Pillow） ----------
@@ -257,20 +316,160 @@ MAX_CARD_BOTTOM = 1500  # 对话卡片下边缘安全线：超出则 5→4→3 �
 VOCAB_WRAP = 32         # 词汇板块换行宽度（24px 字号下 CJK 约 768px < 848px 可用宽度）
 
 
-def _load_font(size: int, bold: bool = False):
-    """加载中文字体：标题粗体优先 msyhbd.ttc，常规用 msyh.ttc，均失败回退 simhei.ttf。"""
-    candidates = (
-        ["C:/Windows/Fonts/msyhbd.ttc", "C:/Windows/Fonts/msyh.ttc",
-         "C:/Windows/Fonts/simhei.ttf"] if bold
-        else ["C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simhei.ttf"]
-    )
-    for path in candidates:
+# 脚本所在目录（字体随项目分发，Windows / Linux / 云端都能用）
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+# ---------- 云端字体自动下载（GitHub 传不上 >25MB 大字体时的兜底方案） ----------
+# Streamlit Cloud 的容器里没有中文字体，而 GitHub 网页端又传不进 msyh.ttc 等大文件；
+# 因此在本地和系统字体全部缺失时，自动下载开源可商用的 Noto Sans SC（约 8MB，
+# 仅首次需要，之后缓存在应用目录直到容器重启）。
+# 注意：原始链接 Sans/OTF/SimplifiedChinese/NotoSansSC-Regular.otf 已 404（仓库改版），
+#       正确地址是 SubsetOTF 子集版（实测存在，8,331,336 字节）；jsDelivr 为备用镜像。
+CLOUD_FONT_URLS = {
+    "NotoSansSC-Regular.otf": [
+        "https://github.com/googlefonts/noto-cjk/raw/main/Sans/SubsetOTF/SC/NotoSansSC-Regular.otf",
+        "https://cdn.jsdelivr.net/gh/googlefonts/noto-cjk@main/Sans/SubsetOTF/SC/NotoSansSC-Regular.otf",
+    ],
+    "NotoSansSC-Bold.otf": [
+        "https://github.com/googlefonts/noto-cjk/raw/main/Sans/SubsetOTF/SC/NotoSansSC-Bold.otf",
+        "https://cdn.jsdelivr.net/gh/googlefonts/noto-cjk@main/Sans/SubsetOTF/SC/NotoSansSC-Bold.otf",
+    ],
+}
+CLOUD_FONT_MIN_BYTES = 8_000_000   # 完整字体约 8.3MB，小于此值视为下载不完整
+CLOUD_FONT_RETRY_SEC = 300        # 下载失败后 5 分钟内不再重试，避免每次点按钮都卡网络
+
+_FONT_DL_LOCK = threading.Lock()  # 进程级互斥锁：Streamlit 每个会话一个线程，共用本模块
+_FONT_DL_FAILED = {}              # {文件名: (错误信息, 失败时间戳)}
+
+
+def _font_file_ok(path: str, min_bytes: int = CLOUD_FONT_MIN_BYTES) -> bool:
+    """字体文件存在且大小正常（防半截文件被当成品用）。"""
+    return os.path.exists(path) and os.path.getsize(path) >= min_bytes
+
+
+def _download_font_atomic(path: str, urls: list, min_bytes: int) -> str:
+    """流式下载字体到 <path>.part，校验大小后 os.replace 原子改名。
+
+    - 原子改名保证并发的其他线程只会看到「完整的成品」或「没有文件」，绝不会读到半截字体
+    - 多个 URL 依次尝试，全部失败抛出最后一个异常
+    """
+    tmp = path + ".part"
+    last_err = None
+    for url in urls:
         try:
-            from PIL import ImageFont
+            with requests.get(url, stream=True, timeout=(10, 180)) as resp:
+                resp.raise_for_status()
+                with open(tmp, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=1 << 16):
+                        if chunk:
+                            f.write(chunk)
+            size = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+            if size >= min_bytes:
+                os.replace(tmp, path)  # 原子操作：要么成功改名，要么目标根本不出现
+                return path
+            last_err = RuntimeError(f"文件不完整（{size} 字节 < {min_bytes}）")
+        except Exception as e:  # noqa: BLE001  单个源失败 → 换下一个源
+            last_err = e
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    raise RuntimeError(f"全部下载源失败：{last_err}")
+
+
+def ensure_cloud_font(name: str) -> str | None:
+    """确保 name 字体存在于应用目录；没有则联网下载（线程安全，不会重复下载）。
+
+    返回字体路径；下载失败返回 None（失败信息缓存 5 分钟，期间不再重试）。
+    """
+    if name not in CLOUD_FONT_URLS:
+        return None
+    urls, min_bytes = CLOUD_FONT_URLS[name], CLOUD_FONT_MIN_BYTES
+    path = os.path.join(APP_DIR, name)
+    if _font_file_ok(path, min_bytes):
+        return path
+
+    with _FONT_DL_LOCK:  # 抢到锁才下载；抢不到的线程等锁，出来后直接用现成文件
+        if _font_file_ok(path, min_bytes):  # 双重检查：等锁期间别人可能已下载完成
+            return path
+        failed = _FONT_DL_FAILED.get(name)
+        if failed and time.time() - failed[1] < CLOUD_FONT_RETRY_SEC:
+            return None
+        try:
+            _download_font_atomic(path, urls, min_bytes)
+            _FONT_DL_FAILED.pop(name, None)
+            return path
+        except Exception as e:  # noqa: BLE001
+            _FONT_DL_FAILED[name] = (str(e), time.time())
+            return None
+
+
+def _font_candidates(bold: bool) -> list:
+    """按优先级拼出候选字体路径：项目内置字体 → 已下载的 Noto → 系统字体（Win/Linux）。"""
+    local = ["msyhbd.ttc", "msyh.ttc", "simhei.ttf"] if bold else ["msyh.ttc", "simhei.ttf"]
+    # 云端兜底：ensure_cloud_font() 下载的 Noto Sans SC（本地没传大字体时的主力）
+    noto = ["NotoSansSC-Bold.otf", "NotoSansSC-Regular.otf"] if bold else ["NotoSansSC-Regular.otf"]
+    win = (
+        ["C:/Windows/Fonts/msyhbd.ttc", "C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simhei.ttf"]
+        if bold else
+        ["C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simhei.ttf"]
+    )
+    # Linux 常见中文字体（Noto CJK / 文泉驿正黑 / 阿里普惠体）
+    linux = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc" if bold else
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/arphic/uming.ttc",
+    ]
+    paths = [os.path.join(APP_DIR, n) for n in local]            # 项目内置（随 GitHub 仓库分发）
+    paths += [os.path.join(APP_DIR, n) for n in noto]            # 云端自动下载的 Noto Sans SC
+    paths += [os.path.join(APP_DIR, "fonts", n) for n in local]  # 也支持放 fonts/ 子目录
+    paths += win + linux
+    return paths
+
+
+def _has_local_cjk_font() -> bool:
+    """本地或系统是否已有可用中文字体（用于决定是否需要提示下载）。"""
+    return any(os.path.exists(p) for p in _font_candidates(False))
+
+
+def _load_font(size: int, bold: bool = False):
+    """加载中文字体：内置 msyh 系 → 已下载 Noto → 系统字体 → 在线下载 Noto。
+
+    全部失败时抛出带原因的 RuntimeError（海报入口有 try/except，页面不会崩）。
+    """
+    from PIL import ImageFont
+
+    for path in _font_candidates(bold):
+        try:
             return ImageFont.truetype(path, size)
         except Exception:  # noqa: BLE001  单个字体缺失/损坏时尝试下一个
             continue
-    raise RuntimeError("未找到可用的中文字体（尝试过 msyhbd.ttc / msyh.ttc / simhei.ttf）")
+
+    # 本地与系统都没有（典型：Streamlit Cloud）→ 在线下载 Noto Sans SC
+    name = "NotoSansSC-Bold.otf" if bold else "NotoSansSC-Regular.otf"
+    noto = ensure_cloud_font(name)
+    if noto:
+        try:
+            return ImageFont.truetype(noto, size)
+        except Exception:  # noqa: BLE001
+            pass
+    if bold:  # Bold 下载失败时用 Regular 顶上（宁可不够粗，不能不出图）
+        reg = ensure_cloud_font("NotoSansSC-Regular.otf")
+        if reg:
+            try:
+                return ImageFont.truetype(reg, size)
+            except Exception:  # noqa: BLE001
+                pass
+
+    raise RuntimeError(
+        "未找到可用的中文字体：本地与系统字体均缺失，在线下载 Noto Sans SC 失败（"
+        f"{_FONT_DL_FAILED.get(name, ('未知原因',))[0]}"
+        "）。请检查网络后重试，或手动下载 NotoSansSC-Regular.otf 放到项目目录。"
+    )
 
 
 def _placeholder_avatar(name: str, size: int = POSTER_AVATAR_SIZE):
@@ -279,7 +478,7 @@ def _placeholder_avatar(name: str, size: int = POSTER_AVATAR_SIZE):
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     d.ellipse((0, 0, size - 1, size - 1), fill=(124, 156, 204, 255))
-    f = ImageFont.truetype("C:/Windows/Fonts/msyh.ttc", int(size * 0.44))
+    f = _load_font(int(size * 0.44))
     ch = (name or "?").strip()[:1] or "?"
     d.text((size / 2, size / 2), ch, font=f, fill="white", anchor="mm")
     return img
@@ -321,19 +520,36 @@ def _load_avatar_image(source, speaker: str = "", size: int = POSTER_AVATAR_SIZE
     return img
 
 
+def _load_emoji_font(size: int):
+    """加载彩色 emoji 字体（✨📚 等）。项目内置优先，其次 Windows 自带；找不到返回 None。
+
+    注：Linux 的 NotoColorEmoji / macOS 的 Apple Color Emoji 是固定尺寸位图字体，
+    PIL 传任意字号会报错，因此不做尝试——调用方会自动回退 ★ 或纯文字，跨平台不受影响。
+    """
+    from PIL import ImageFont
+    for path in (os.path.join(APP_DIR, "seguiemj.ttf"), "C:/Windows/Fonts/seguiemj.ttf"):
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
 def _draw_poster_title(draw, canvas_w: int, y: int) -> None:
-    """居中绘制大标题：✨ 用 Windows 彩色 emoji 字体（seguiemj）混排；
+    """居中绘制大标题：✨ 用彩色 emoji 字体混排；
     雅黑没有 U+2728 字形，直接画会变成方框。emoji 字体不可用时回退 ★。"""
     f_core = _load_font(50, bold=True)
+    f_emoji = _load_emoji_font(50)
     segments = []  # [文本, 字体, 是否彩色emoji]
-    try:
-        from PIL import ImageFont
-        f_emoji = ImageFont.truetype("C:/Windows/Fonts/seguiemj.ttf", 50)
-        draw.textlength("✨", font=f_emoji)  # 探测 emoji 字体宽度可用性
-        segments = [("✨ ", f_emoji, True),
-                    (POSTER_TITLE_CORE, f_core, False),
-                    (" ✨", f_emoji, True)]
-    except Exception:  # noqa: BLE001  无 seguiemj 或渲染失败 → ★ 兜底（雅黑有该字形）
+    if f_emoji is not None:
+        try:
+            draw.textlength("✨", font=f_emoji)  # 探测 emoji 字体宽度可用性
+            segments = [("✨ ", f_emoji, True),
+                        (POSTER_TITLE_CORE, f_core, False),
+                        (" ✨", f_emoji, True)]
+        except Exception:  # noqa: BLE001  渲染失败 → ★ 兜底（雅黑有该字形）
+            f_emoji = None
+    if not segments:
         segments = [("★ ", f_core, False),
                     (POSTER_TITLE_CORE, f_core, False),
                     (" ★", f_core, False)]
@@ -352,15 +568,17 @@ def _draw_emoji_heading(draw, x: int, y: int, emoji: str, text: str,
                         size: int, fill: str = POSTER_COLOR) -> None:
     """左对齐绘制「emoji + 文字」标题：emoji 用彩色字体（如 📚），缺失时省略 emoji 只画文字。"""
     f_core = _load_font(size, bold=True)
-    try:
-        from PIL import ImageFont
-        f_e = ImageFont.truetype("C:/Windows/Fonts/seguiemj.ttf", size)
-        draw.textlength(emoji, font=f_e)  # 探测可用性
-        pad = draw.textlength(emoji + " ", font=f_e)
-        draw.text((x, y), emoji + " ", font=f_e, embedded_color=True, anchor="la")
-        draw.text((x + pad, y), text, font=f_core, fill=fill, anchor="la")
-    except Exception:  # noqa: BLE001  无彩色 emoji 字体 → 只画文字
-        draw.text((x, y), text, font=f_core, fill=fill, anchor="la")
+    f_e = _load_emoji_font(size)
+    if f_e is not None:
+        try:
+            draw.textlength(emoji, font=f_e)  # 探测可用性
+            pad = draw.textlength(emoji + " ", font=f_e)
+            draw.text((x, y), emoji + " ", font=f_e, embedded_color=True, anchor="la")
+            draw.text((x + pad, y), text, font=f_core, fill=fill, anchor="la")
+            return
+        except Exception:  # noqa: BLE001  无彩色 emoji 字体 → 只画文字
+            pass
+    draw.text((x, y), text, font=f_core, fill=fill, anchor="la")
 
 
 def generate_poster(scene: str, level: str, dialogue: list, avatars: dict = None,
@@ -522,9 +740,22 @@ RP_SYSTEM_PROMPT = """你是 LinguaCraft 的英语陪练伙伴。下方提供一
 3. 用户可能用中文或英文发言，你始终以「{ai_role}」的身份用英文回应（必要时先用一句简短英文接住对方的话）；
 4. 若用户想结束或转换话题，可以自然收尾，但仍保持角色口吻。"""
 
+# ---------- 学习模式（剧本 / 听写） ----------
+MODE_SCRIPT = "📖 剧本模式"
+MODE_DICTATION = "✍️ 听写模式"
+DICTATION_COUNT = 3  # 听写每轮从剧本抽取的英文台词句数
+WRONG_MAX = 50       # 错题集最多保留的条数
+
 # ---------- 会话状态 ----------
 if "api_key" not in st.session_state:
     st.session_state.api_key = ""
+if "app_mode" not in st.session_state:
+    st.session_state.app_mode = MODE_SCRIPT  # 当前学习模式（侧边栏单选）
+if "dictation_sentences" not in st.session_state:
+    st.session_state.dictation_sentences = []  # 听写题面：剧本前 3 句英文台词
+if "dictation_wrong" not in st.session_state:
+    # 📕 错题集：[{sentence, answer, scene, time, fixed}]，最新在前，跨剧本累积
+    st.session_state.dictation_wrong = []
 if "just_done" not in st.session_state:
     st.session_state.just_done = False
 if "entered" not in st.session_state:
@@ -845,8 +1076,8 @@ def render_script(parsed: dict) -> None:
             _, btn_col = st.columns([3, 2])
         if btn_col.button("🔊 播放语音", key=f"tts_{i}", use_container_width=True):
             try:
-                mp3_path = tts_speak(en, voice_of[speaker])
-                st.audio(mp3_path, format="audio/mp3", autoplay=True)
+                audio_bytes = tts_speak(en, voice_of[speaker])
+                st.audio(audio_bytes, format="audio/mp3", autoplay=True)
             except Exception as e:  # noqa: BLE001
                 st.error(f"语音合成失败：{e}（edge-tts 需联网访问微软服务；也可运行 `pip install edge-tts`）")
 
@@ -892,6 +1123,199 @@ def render_script(parsed: dict) -> None:
                 vocab.remove(item)
 
 
+# ---------- ✍️ 听写训练（听音 → 拼写 → 核对） ----------
+def _norm_answer(text: str) -> str:
+    """核对答案的标准化：忽略大小写、首尾/多余空格与标点差异（听写时听不出逗号句号）。
+
+    - 弯引号统一为直引号，撇号直接去掉（don't / dont 视为相同）
+    - 其余标点替换为空格，再把连续空白压成一个空格
+    """
+    s = (text or "").strip().lower()
+    s = s.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
+    s = s.replace("'", "")
+    s = re.sub(r"[^\w\s]", " ", s, flags=re.UNICODE)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+def _reset_dictation(sig: str, count: int) -> None:
+    """「🔄 重做本组听写」回调：清空答案与核对结果（音频缓存保留，避免重复合成）。
+
+    注意：必须在回调里修改控件 key，控件实例化后再改会抛 StreamlitAPIException。
+    """
+    ss = st.session_state
+    for i in range(1, count + 1):
+        ss.pop(f"dict_in_{sig}_{i}", None)
+    ss.pop(f"dict_fb_{sig}", None)
+
+
+def _clear_wrong() -> None:
+    """「🗑 清空错题集」回调：整本清空。"""
+    st.session_state.dictation_wrong = []
+
+
+def _record_wrong(sentence: str, answer: str, scene: str = "") -> None:
+    """判错时把句子收进错题集：同一句只保留一条，更新为最新的错误拼写并置顶。"""
+    items = st.session_state.dictation_wrong
+    now = datetime.now().strftime("%m-%d %H:%M")
+    for it in items:
+        if it["sentence"] == sentence:
+            it.update({"answer": (answer or "").strip(), "scene": scene or it.get("scene", ""),
+                       "time": now, "fixed": False})
+            items.remove(it)
+            items.insert(0, it)
+            return
+    items.insert(0, {
+        "sentence": sentence,
+        "answer": (answer or "").strip(),
+        "scene": scene,
+        "time": now,
+        "fixed": False,
+    })
+    del items[WRONG_MAX:]
+
+
+def _mark_wrong_fixed(sentence: str) -> bool:
+    """答对时把错题集里的同一句标记为「已订正」；返回是否命中错题。"""
+    for it in st.session_state.dictation_wrong:
+        if it["sentence"] == sentence and not it.get("fixed"):
+            it["fixed"] = True
+            return True
+    return False
+
+
+def extract_dictation_items(parsed: dict, limit: int = DICTATION_COUNT) -> list:
+    """从剧本取前 limit 句英文台词，返回 [[英文, 中文意思], ...]（中文可能为空串）。"""
+    dialogue = parsed.get("dialogue") or []
+    items = []
+    for _, en, zh in dialogue:
+        if (en or "").strip():
+            items.append([en.strip(), (zh or "").strip()])
+    return items[:limit]
+
+
+def extract_dictation_sentences(parsed: dict, limit: int = DICTATION_COUNT) -> list:
+    """只要英文题面的版本（保留给复用/调试）。"""
+    return [en for en, _ in extract_dictation_items(parsed, limit)]
+
+
+def render_dictation(parsed: dict, script_text: str) -> None:
+    """听写训练面板：逐句播放 TTS 音频（不显示原文）→ 输入拼写 → 核对答案。"""
+    st.subheader("✍️ 听写训练 · 听音写句")
+
+    # 上一轮核对引发的 toast（rerun 会丢弃当次 UI，故用会话标记带过来）
+    _pending_toast = st.session_state.pop("_dict_toast", None)
+    if _pending_toast:
+        st.toast(_pending_toast, icon="📕")
+
+    sentences = extract_dictation_sentences(parsed)
+    if not sentences:
+        st.warning("没能从当前剧本里提取到英文台词，暂时无法开始听写。")
+        return
+
+    items = extract_dictation_items(parsed)  # [[英文, 中文意思], ...]
+    # 题面存进 session_state（同一份剧本始终对应同一组题）
+    st.session_state.dictation_sentences = sentences
+    cur_scene = st.session_state.get("result_scene", "")
+
+    # 用剧本内容哈希做控件 key 前缀：换剧本 → 自动换一组全新的输入框与核对结果
+    sig = hashlib.md5(script_text.encode("utf-8")).hexdigest()[:10]
+    ss = st.session_state
+
+    audio_map = ss.get(f"dict_audio_{sig}")
+    if not isinstance(audio_map, dict):
+        audio_map = {}
+        ss[f"dict_audio_{sig}"] = audio_map  # {句序号: mp3 bytes}
+    feedback = ss.get(f"dict_fb_{sig}")
+    if not isinstance(feedback, dict):
+        feedback = {}
+        ss[f"dict_fb_{sig}"] = feedback  # {句序号: True/False}
+
+    total = len(sentences)
+    st.caption(
+        f"本轮从剧本抽取前 {total} 句英文台词：点「🔊 播放音频」听原声（不显示原文），"
+        "写出你听到的句子后核对。卡住时点「💡 中文提示」只看意思。"
+        "忽略大小写、空格与标点差异，判错的句子会自动收进顶部「📕 我的错题集」。"
+    )
+
+    for i, (sentence, zh) in enumerate(items, 1):
+        with st.container(border=True):
+            st.markdown(f"**第 {i} / {total} 句**")
+
+            clicked_play = st.button(
+                "🔊 播放音频", key=f"dict_play_{sig}_{i}", use_container_width=True,
+            )
+            if clicked_play:
+                try:
+                    with st.spinner("正在合成语音…"):
+                        audio_map[i] = tts_speak(sentence, TTS_VOICES[0])
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"语音合成失败：{e}（edge-tts 需联网访问微软服务）")
+
+            if audio_map.get(i):
+                # 仅点击按钮的那一次自动播放；浏览器禁止无交互自动播放，故同时保留播放器手动重听
+                st.audio(audio_map[i], format="audio/mp3", autoplay=clicked_play)
+            else:
+                st.caption("点击上方按钮生成并播放音频（首次约需 1~2 秒）。")
+
+            # 💡 中文提示：popover 只给语义，不显示英文拼写，避免直接抄答案
+            with st.popover("💡 中文提示"):
+                if zh:
+                    st.markdown(f"**{zh}**")
+                    st.caption("只给意思，拼写还是要靠耳朵 🎧")
+                else:
+                    st.caption("这句剧本里没有附中文翻译，先多听两遍音频吧～")
+
+            answer = st.text_input(
+                "请听音拼写这句话",
+                key=f"dict_in_{sig}_{i}",
+                placeholder="Type the sentence you hear…",
+            )
+            if st.button(
+                "核对答案", key=f"dict_ck_{sig}_{i}",
+                type="primary", use_container_width=True,
+            ):
+                if not answer.strip():
+                    st.warning("先写下你听到的句子，再核对答案～")
+                else:
+                    ok = _norm_answer(answer) == _norm_answer(sentence)
+                    feedback[i] = ok
+                    if ok:
+                        if _mark_wrong_fixed(sentence):
+                            st.session_state["_dict_toast"] = "✅ 错题订正成功，错题集里已标记"
+                    else:
+                        _record_wrong(sentence, answer, cur_scene)
+                    st.rerun()  # 立即刷新顶部「📕 我的错题集」计数与进度
+
+            if i in feedback:
+                if feedback[i]:
+                    st.success("太棒了，完全正确！")
+                else:
+                    st.error(f"有点出入，原文是：{sentence}")
+                    ratio = difflib.SequenceMatcher(
+                        None, _norm_answer(answer), _norm_answer(sentence)
+                    ).ratio()
+                    st.caption(f"拼写相似度约 {ratio:.0%}，已收进错题集；再听一遍音频对照一下吧。")
+
+    right = sum(1 for ok in feedback.values() if ok)
+    checked = len(feedback)
+    st.progress(
+        checked / total if total else 0.0,
+        text=f"已核对 {checked} / {total} 句　·　正确 {right} 句",
+    )
+    if checked == total:
+        if right == total:
+            st.balloons()
+            st.success(f"🎉 全对！{total} / {total} 句一字不差，听力与拼写都很稳。")
+        else:
+            st.info(f"本组完成：正确 {right} / {total} 句。错句可以「🔄 重做本组听写」再练一遍。")
+
+    st.button(
+        "🔄 重做本组听写", use_container_width=True,
+        on_click=_reset_dictation, args=(sig, total),
+    )
+
+
 # ---------- 页头 ----------
 st.markdown('<div class="hero-title">🎭 LinguaCraft</div>', unsafe_allow_html=True)
 st.markdown(
@@ -916,8 +1340,42 @@ with st.expander(f"📖 我的专属生词本（{len(st.session_state.vocab)} �
     else:
         st.caption("暂无收藏。生成剧本后，在「✨ 关键表达」中勾选即可加入生词本～")
 
+# ---------- 📕 我的错题集（页面顶部，跨剧本累积） ----------
+_wrong_items = st.session_state.dictation_wrong
+_wrong_pending = sum(1 for w in _wrong_items if not w.get("fixed"))
+if _wrong_items:
+    _wrong_suffix = f" · 待复习 {_wrong_pending}" if _wrong_pending else " · 已全部订正"
+    _wrong_label = f"📕 我的错题集（{len(_wrong_items)} 句{_wrong_suffix}）"
+else:
+    _wrong_label = "📕 我的错题集（0 句）"
+with st.expander(_wrong_label):
+    if _wrong_items:
+        _esc = html_lib.escape
+        # 未订正的排前面，订正过的收在下面
+        for w in sorted(_wrong_items, key=lambda x: bool(x.get("fixed"))):
+            icon = "✅" if w.get("fixed") else "❌"
+            st.markdown(f"{icon} **{_esc(w['sentence'])}**")
+            meta = f"我的拼写：{_esc(w.get('answer') or '（空）')}　·　{w.get('time', '')}"
+            if w.get("scene"):
+                meta += f"　·　{_esc(w['scene'])}"
+            st.caption(meta)
+        st.button("🗑 清空错题集", on_click=_clear_wrong)
+    else:
+        st.caption(
+            "暂无错题。听写模式下判错的句子会自动收进这里（跨剧本累积），"
+            "订正后再答对会自动打上 ✅～"
+        )
+
 # ---------- 侧边栏 ----------
 with st.sidebar:
+    st.radio(
+        "🧭 学习模式",
+        [MODE_SCRIPT, MODE_DICTATION],
+        key="app_mode",
+        help="剧本模式：生成剧本 + 朗读跟读 + 角色扮演对戏；"
+             "听写模式：从当前剧本抽前 3 句英文做听音拼写训练",
+    )
+    st.divider()
     st.header("⚙️ 剧本配置")
 
     scene = st.text_input(
@@ -1147,15 +1605,28 @@ with col_feature:
             if amb_url:
                 amb_label = SCENE_AUDIO_LABELS.get(amb_url, "环境音")
                 st.info(f"🎧 环境音效已就绪（{amb_label}），点击下方播放，沉浸式练习吧！")
-                # 本地 WAV / MP3 文件均可直接播放；loop=True 循环播放不打断练习
+                # 本地文件读成字节再播放（云端相对路径解析易失败 → 0:00）；URL 原样交给前端
                 amb_format = "audio/wav" if amb_url.endswith(".wav") else "audio/mp3"
                 try:
-                    st.audio(amb_url, format=amb_format, loop=True)
-                except TypeError:  # 旧版 Streamlit 不支持 loop 参数
-                    st.audio(amb_url, format=amb_format)
+                    amb_data = (amb_url if amb_url.startswith(("http://", "https://"))
+                                else open(amb_url, "rb").read())
+                    try:
+                        st.audio(amb_data, format=amb_format, loop=True)
+                    except TypeError:  # 旧版 Streamlit 不支持 loop 参数
+                        st.audio(amb_data, format=amb_format)
+                except OSError:
+                    st.warning(f"环境音文件缺失：{amb_url}（请确认已随项目一起上传）")
 
             parsed = parse_script(st.session_state.result)
-            if parsed:
+            in_dictation = st.session_state.get("app_mode") == MODE_DICTATION
+            if in_dictation:
+                if parsed:
+                    # 听写模式：只出题，绝不展示英文原文
+                    render_dictation(parsed, st.session_state.result)
+                else:
+                    st.warning("剧本解析失败，无法提取英文台词，暂不能听写。下面是原始文本：")
+                    st.markdown(st.session_state.result)
+            elif parsed:
                 render_script(parsed)
             else:
                 st.markdown(st.session_state.result)
@@ -1169,161 +1640,177 @@ with col_feature:
         if dl_clicked:
             st.snow()  # 下载成功 ❄️ 飘雪
         with st.expander("📋 查看纯文本 / 复制"):
+            if in_dictation:
+                st.caption("⚠️ 这里是听写答案，展开前先自己写完哦～")
             st.code(st.session_state.result, language=None)
 
-        # ---------- 🖼️ 生成分享海报（Pillow 合成） ----------
-        st.divider()
-        poster_bg = "bg.png"
-        bg_files = [p for p in POSTER_BG_LABELS if os.path.exists(p)]
-        if len(bg_files) > 1:
-            poster_bg = st.radio(
-                "海报背景", bg_files,
-                format_func=lambda p: POSTER_BG_LABELS.get(p, p),
-                horizontal=True, key="poster_bg",
-            )
-        elif bg_files:
-            poster_bg = bg_files[0]
-
-        # 对话提取：前 4~5 个回合（最多 5 句话，海报排版会自动做安全降级）
-        poster_lines = (parsed.get("dialogue") or [])[:5] if parsed else []
-
-        # 我的形象贴给哪个角色（其余角色自动生成 DiceBear 头像）
-        if poster_lines:
-            poster_speakers = []
-            for r in poster_lines:
-                if r[0] not in poster_speakers:
-                    poster_speakers.append(r[0])
-            pick_options = poster_speakers + ["都不用"]
-            if st.session_state.get("poster_me") not in pick_options:
-                st.session_state.poster_me = poster_speakers[0]
-            st.selectbox(
-                "🙋 我的形象贴给哪个角色", pick_options, key="poster_me",
-                help="选中的角色使用左侧「我的形象」头像；其余角色按名字自动生成头像",
-            )
-
-        if st.button("🖼️ 生成分享海报", use_container_width=True):
-            if not poster_lines:
-                st.error("剧本解析失败，无法提取对话内容，暂不能生成海报。")
-            else:
-                my_pick = st.session_state.get("poster_me", "")
-                avatars = {}
-                for row in poster_lines:
-                    speaker = row[0]
-                    if speaker in avatars:
-                        continue
-                    if speaker == my_pick:
-                        # 我的形象（DiceBear SVG URL，合成时自动转 PNG 拉取）
-                        avatars[speaker] = avatar_url
-                    else:
-                        # 其余角色：按角色名生成确定性 DiceBear 头像（PNG 接口）
-                        avatars[speaker] = ("https://api.dicebear.com/7.x/adventurer/png?seed="
-                                            + quote(speaker))
-                p_scene = st.session_state.get("result_scene", scene.strip() or "日常情景")
-                p_level = st.session_state.get("result_level", level)
-                p_vocab = [e for e in (parsed.get("expressions") or [])[:2]] if parsed else []
-                try:
-                    out = generate_poster(p_scene, p_level, poster_lines, avatars,
-                                          vocab=p_vocab, bg_path=poster_bg)
-                    st.image(out, use_container_width=True)
-                    with open(out, "rb") as f:
-                        st.download_button(
-                            "📥 下载海报 PNG", data=f,
-                            file_name="linguacraft_poster.png", mime="image/png",
-                            use_container_width=True,
-                        )
-                except Exception as e:  # noqa: BLE001  字体缺失 / Pillow 未安装等
-                    st.error(f"海报生成失败：{e}")
-
-        # ---------- 🎭 角色扮演：以剧本为上下文继续对戏 ----------
-        st.divider()
-        st.subheader("🎭 角色扮演 · 和剧本角色继续对话")
-        st.caption(
-            "输入你的台词，AI 会扮演剧本中的另一个角色与你即兴对戏；"
-            "对话历史保存在本次会话中，生成新剧本会自动清空。"
-        )
-
-        ss = st.session_state
-        if "chat_history" not in ss:
-            ss.chat_history = []
-
-        # AI 扮演谁：从剧本说话人中选（默认第二个出场角色）；剧本解析失败时用通用兜底
-        speakers = []
-        for s, _, _ in (parsed.get("dialogue") or []) if parsed else []:
-            if s not in speakers:
-                speakers.append(s)
-        if ss.get("rp_ai_role") not in speakers:
-            ss.rp_ai_role = speakers[1] if len(speakers) > 1 else (speakers[0] if speakers else "")
-
-        col_role, col_clear = st.columns([3, 1])
-        if speakers:
-            with col_role:
-                ai_role = st.selectbox(
-                    "🤖 AI 扮演的角色", speakers,
-                    key="rp_ai_role", on_change=_clear_chat,
-                    help="切换角色将开始一段新的对戏",
+        # 听写模式下隐藏海报 / 角色扮演，保持训练专注
+        if not in_dictation:
+            # ---------- 🖼️ 生成分享海报（Pillow 合成） ----------
+            st.divider()
+            poster_bg = "bg.png"
+            bg_files = [p for p in POSTER_BG_LABELS if os.path.exists(p)]
+            if len(bg_files) > 1:
+                poster_bg = st.radio(
+                    "海报背景", bg_files,
+                    format_func=lambda p: POSTER_BG_LABELS.get(p, p),
+                    horizontal=True, key="poster_bg",
                 )
-        else:
-            with col_role:
-                ai_role = "对方角色"
-                st.caption("🤖 AI 将扮演剧本中的对方角色")
-        col_clear.button("🧹 清空对话", on_click=_clear_chat, use_container_width=True)
+            elif bg_files:
+                poster_bg = bg_files[0]
 
-        voice_map = _voice_map(parsed) if parsed else {}
-        ai_voice = voice_map.get(ai_role)
+            # 对话提取：前 4~5 个回合（最多 5 句话，海报排版会自动做安全降级）
+            poster_lines = (parsed.get("dialogue") or [])[:5] if parsed else []
 
-        # 历史消息：st.chat_message 渲染；AI 回复附翻译与朗读按钮
-        for i, m in enumerate(ss.chat_history):
-            if m["role"] == "user":
-                with st.chat_message("user", avatar=avatar_url):
-                    st.markdown(m["content"])
-            else:
-                with st.chat_message("assistant", avatar="🎭"):
-                    en, zh = split_en_zh(m["content"])
-                    st.markdown(en)
-                    if zh:
-                        st.caption(f"（{zh}）")
-                    if ai_voice:
-                        if st.button("🔊 播放语音", key=f"chat_tts_{i}"):
-                            try:
-                                mp3_path = tts_speak(" ".join(en.split()), ai_voice)
-                                st.audio(mp3_path, format="audio/mp3", autoplay=True)
-                            except Exception as e:  # noqa: BLE001
-                                st.error(f"语音合成失败：{e}")
+            # 我的形象贴给哪个角色（其余角色自动生成 DiceBear 头像）
+            if poster_lines:
+                poster_speakers = []
+                for r in poster_lines:
+                    if r[0] not in poster_speakers:
+                        poster_speakers.append(r[0])
+                pick_options = poster_speakers + ["都不用"]
+                if st.session_state.get("poster_me") not in pick_options:
+                    st.session_state.poster_me = poster_speakers[0]
+                st.selectbox(
+                    "🙋 我的形象贴给哪个角色", pick_options, key="poster_me",
+                    help="选中的角色使用左侧「我的形象」头像；其余角色按名字自动生成头像",
+                )
 
-        # 输入框（固定在列底部）
-        user_line = st.chat_input("输入你的台词...")
-        if user_line:
-            if not st.session_state.api_key.strip():
-                st.error("角色扮演需要 API Key，请在左侧边栏「🔑 API 配置」中填写。")
-            else:
-                ss.chat_history.append({"role": "user", "content": user_line})
-                with st.chat_message("user", avatar=avatar_url):
-                    st.markdown(user_line)
-                with st.chat_message("assistant", avatar="🎭"):
+            if st.button("🖼️ 生成分享海报", use_container_width=True):
+                if not poster_lines:
+                    st.error("剧本解析失败，无法提取对话内容，暂不能生成海报。")
+                else:
+                    my_pick = st.session_state.get("poster_me", "")
+                    avatars = {}
+                    for row in poster_lines:
+                        speaker = row[0]
+                        if speaker in avatars:
+                            continue
+                        if speaker == my_pick:
+                            # 我的形象（DiceBear SVG URL，合成时自动转 PNG 拉取）
+                            avatars[speaker] = avatar_url
+                        else:
+                            # 其余角色：按角色名生成确定性 DiceBear 头像（PNG 接口）
+                            avatars[speaker] = ("https://api.dicebear.com/7.x/adventurer/png?seed="
+                                                + quote(speaker))
+                    p_scene = st.session_state.get("result_scene", scene.strip() or "日常情景")
+                    p_level = st.session_state.get("result_level", level)
+                    p_vocab = [e for e in (parsed.get("expressions") or [])[:2]] if parsed else []
+                    # 云端首次运行：本地/系统都没有中文字体时，先带进度提示把 Noto 下载好
+                    #（下载逻辑本身线程安全且幂等，这里只是为了给用户看得见的反馈）
+                    if not _has_local_cjk_font():
+                        with st.spinner("⬇️ 正在下载中文字体 Noto Sans SC（约 8MB × 2，仅首次需要）…"):
+                            ensure_cloud_font("NotoSansSC-Regular.otf")
+                            ensure_cloud_font("NotoSansSC-Bold.otf")
                     try:
-                        reply = st.write_stream(
-                            stream_chat(
-                                base_url, model, st.session_state.api_key.strip(),
-                                st.session_state.result, list(ss.chat_history), ai_role,
+                        out = generate_poster(p_scene, p_level, poster_lines, avatars,
+                                              vocab=p_vocab, bg_path=poster_bg)
+                        st.image(out, use_container_width=True)
+                        with open(out, "rb") as f:
+                            st.download_button(
+                                "📥 下载海报 PNG", data=f,
+                                file_name="linguacraft_poster.png", mime="image/png",
+                                use_container_width=True,
                             )
-                        )
-                    except requests.exceptions.Timeout:
-                        st.error("请求超时，请检查网络后重试。")
-                    except requests.exceptions.HTTPError as e:
-                        code = e.response.status_code
-                        st.error(f"接口返回错误 {code}：`{e.response.text[:200]}`")
-                    except Exception as e:  # noqa: BLE001
-                        st.error(f"对话失败：{e}")
-                    else:
-                        if reply and reply.strip():
-                            ss.chat_history.append({"role": "assistant", "content": reply.strip()})
-                        st.rerun()  # 重渲染为带翻译与朗读按钮的整洁历史消息
+                    except Exception as e:  # noqa: BLE001  字体缺失 / Pillow 未安装等
+                        st.error(f"海报生成失败：{e}")
+
+            # ---------- 🎭 角色扮演：以剧本为上下文继续对戏 ----------
+            st.divider()
+            st.subheader("🎭 角色扮演 · 和剧本角色继续对话")
+            st.caption(
+                "输入你的台词，AI 会扮演剧本中的另一个角色与你即兴对戏；"
+                "对话历史保存在本次会话中，生成新剧本会自动清空。"
+            )
+
+            ss = st.session_state
+            if "chat_history" not in ss:
+                ss.chat_history = []
+
+            # AI 扮演谁：从剧本说话人中选（默认第二个出场角色）；剧本解析失败时用通用兜底
+            speakers = []
+            for s, _, _ in (parsed.get("dialogue") or []) if parsed else []:
+                if s not in speakers:
+                    speakers.append(s)
+            if ss.get("rp_ai_role") not in speakers:
+                ss.rp_ai_role = speakers[1] if len(speakers) > 1 else (speakers[0] if speakers else "")
+
+            col_role, col_clear = st.columns([3, 1])
+            if speakers:
+                with col_role:
+                    ai_role = st.selectbox(
+                        "🤖 AI 扮演的角色", speakers,
+                        key="rp_ai_role", on_change=_clear_chat,
+                        help="切换角色将开始一段新的对戏",
+                    )
+            else:
+                with col_role:
+                    ai_role = "对方角色"
+                    st.caption("🤖 AI 将扮演剧本中的对方角色")
+            col_clear.button("🧹 清空对话", on_click=_clear_chat, use_container_width=True)
+
+            voice_map = _voice_map(parsed) if parsed else {}
+            ai_voice = voice_map.get(ai_role)
+
+            # 历史消息：st.chat_message 渲染；AI 回复附翻译与朗读按钮
+            for i, m in enumerate(ss.chat_history):
+                if m["role"] == "user":
+                    with st.chat_message("user", avatar=avatar_url):
+                        st.markdown(m["content"])
+                else:
+                    with st.chat_message("assistant", avatar="🎭"):
+                        en, zh = split_en_zh(m["content"])
+                        st.markdown(en)
+                        if zh:
+                            st.caption(f"（{zh}）")
+                        if ai_voice:
+                            if st.button("🔊 播放语音", key=f"chat_tts_{i}"):
+                                try:
+                                    audio_bytes = tts_speak(" ".join(en.split()), ai_voice)
+                                    st.audio(audio_bytes, format="audio/mp3", autoplay=True)
+                                except Exception as e:  # noqa: BLE001
+                                    st.error(f"语音合成失败：{e}")
+
+            # 输入框（固定在列底部）
+            user_line = st.chat_input("输入你的台词...")
+            if user_line:
+                if not st.session_state.api_key.strip():
+                    st.error("角色扮演需要 API Key，请在左侧边栏「🔑 API 配置」中填写。")
+                else:
+                    ss.chat_history.append({"role": "user", "content": user_line})
+                    with st.chat_message("user", avatar=avatar_url):
+                        st.markdown(user_line)
+                    with st.chat_message("assistant", avatar="🎭"):
+                        try:
+                            reply = st.write_stream(
+                                stream_chat(
+                                    base_url, model, st.session_state.api_key.strip(),
+                                    st.session_state.result, list(ss.chat_history), ai_role,
+                                )
+                            )
+                        except requests.exceptions.Timeout:
+                            st.error("请求超时，请检查网络后重试。")
+                        except requests.exceptions.HTTPError as e:
+                            code = e.response.status_code
+                            st.error(f"接口返回错误 {code}：`{e.response.text[:200]}`")
+                        except Exception as e:  # noqa: BLE001
+                            st.error(f"对话失败：{e}")
+                        else:
+                            if reply and reply.strip():
+                                ss.chat_history.append({"role": "assistant", "content": reply.strip()})
+                            st.rerun()  # 重渲染为带翻译与朗读按钮的整洁历史消息
     else:
-        st.markdown(
-            '<div class="feature-card">👈 请在左侧边栏选择场景与难度，填好 API Key 后'
-            '点击 <b>🚀 一键生成剧本</b> 开始体验。</div>',
-            unsafe_allow_html=True,
-        )
+        if st.session_state.get("app_mode") == MODE_DICTATION:
+            st.info(
+                "✍️ 听写模式需要一份剧本作为题目来源：请在左侧填写场景 / 难度后点击"
+                "「🚀 一键生成剧本」，或从「🕘 历史记录」回看一份旧剧本。"
+            )
+        else:
+            st.markdown(
+                '<div class="feature-card">👈 请在左侧边栏选择场景与难度，填好 API Key 后'
+                '点击 <b>🚀 一键生成剧本</b> 开始体验。</div>',
+                unsafe_allow_html=True,
+            )
 
 with col_tip:
     st.subheader("✨ 为什么用 LinguaCraft")
